@@ -1685,6 +1685,7 @@ impl ModelProvider for DockerModelRunnerProvider {
 /// `POST /api/v1/models/download` and listed via `GET /v1/models`.
 pub struct LmStudioProvider {
     base_url: String,
+    api_key: Option<String>,
 }
 
 fn normalize_lmstudio_host(raw: &str) -> Option<String> {
@@ -1720,7 +1721,10 @@ impl Default for LmStudioProvider {
                 normalized
             })
             .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
-        Self { base_url }
+        let api_key = std::env::var("LMSTUDIO_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        Self { base_url, api_key }
     }
 }
 
@@ -1744,12 +1748,16 @@ impl LmStudioProvider {
     /// Returns `(available, installed_models, count)`.
     pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
         let mut set = HashSet::new();
-        let Ok(resp) = ureq::get(&self.models_url())
-            .config()
-            .timeout_global(Some(std::time::Duration::from_millis(800)))
-            .build()
-            .call()
-        else {
+        let Ok(resp) = ({
+            let mut req = ureq::get(&self.models_url())
+                .config()
+                .timeout_global(Some(std::time::Duration::from_millis(800)))
+                .build();
+            if let Some(ref key) = self.api_key {
+                req = req.header("Authorization", &format!("Bearer {}", key));
+            }
+            req.call()
+        }) else {
             return (false, set, 0);
         };
 
@@ -1818,12 +1826,14 @@ impl ModelProvider for LmStudioProvider {
     }
 
     fn is_available(&self) -> bool {
-        ureq::get(&self.models_url())
+        let mut req = ureq::get(&self.models_url())
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build()
-            .call()
-            .is_ok()
+            .build();
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        req.call().is_ok()
     }
 
     fn installed_models(&self) -> HashSet<String> {
@@ -1834,6 +1844,7 @@ impl ModelProvider for LmStudioProvider {
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
         let download_url = self.download_url();
         let models_url = self.models_url();
+        let api_key = self.api_key.clone();
         let tag = match lmstudio_pull_tag(model_tag) {
             Some(t) => t,
             None => {
@@ -1858,11 +1869,14 @@ impl ModelProvider for LmStudioProvider {
             // close the stream while the download proceeds in the background.
             // In the latter case we poll the installed models list to detect
             // eventual completion.
-            let resp = ureq::post(&download_url)
+            let mut req = ureq::post(&download_url)
                 .config()
                 .timeout_global(Some(std::time::Duration::from_secs(3600)))
-                .build()
-                .send_json(&body);
+                .build();
+            if let Some(ref key) = api_key {
+                req = req.header("Authorization", &format!("Bearer {}", key));
+            }
+            let resp = req.send_json(&body);
 
             match resp {
                 Ok(resp) => {
@@ -1969,12 +1983,14 @@ impl ModelProvider for LmStudioProvider {
                         for poll_num in 0..max_polls {
                             std::thread::sleep(poll_interval);
 
-                            let Ok(resp) = ureq::get(&models_url)
+                            let mut req = ureq::get(&models_url)
                                 .config()
                                 .timeout_global(Some(std::time::Duration::from_secs(5)))
-                                .build()
-                                .call()
-                            else {
+                                .build();
+                            if let Some(ref key) = api_key {
+                                req = req.header("Authorization", &format!("Bearer {}", key));
+                            }
+                            let Ok(resp) = req.call() else {
                                 continue;
                             };
 
@@ -3434,6 +3450,34 @@ mod tests {
         assert!(candidates.contains(&"qwen3".to_string()));
         // No slash, so repo == full name — no duplicate
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_lmstudio_provider_default_reads_api_key() {
+        use std::env;
+
+        // Save and restore the original value (or absence) of LMSTUDIO_API_KEY.
+        let had_key = env::var("LMSTUDIO_API_KEY").ok();
+        env::remove_var("LMSTUDIO_API_KEY");
+
+        let provider = LmStudioProvider::default();
+        assert!(provider.api_key.is_none());
+
+        // Set to a real value — should be picked up.
+        env::set_var("LMSTUDIO_API_KEY", "my-secret-key");
+        let provider2 = LmStudioProvider::default();
+        assert_eq!(provider2.api_key, Some("my-secret-key".to_string()));
+
+        // Set to empty string — must NOT produce `Some("")`.
+        env::set_var("LMSTUDIO_API_KEY", "");
+        let provider3 = LmStudioProvider::default();
+        assert!(provider3.api_key.is_none());
+
+        // Restore original state.
+        match had_key {
+            Some(val) => env::set_var("LMSTUDIO_API_KEY", val),
+            None => env::remove_var("LMSTUDIO_API_KEY"),
+        }
     }
 
     #[test]
